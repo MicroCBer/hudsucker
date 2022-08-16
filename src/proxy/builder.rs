@@ -6,6 +6,15 @@ use hyper::{
     client::{connect::Connect, Client, HttpConnector},
     server::conn::AddrIncoming,
 };
+
+use hyper::{Client, Request, Uri};
+use futures::{TryFutureExt, TryStreamExt};
+use hyper_proxy::{Proxy, ProxyConnector, Intercept};
+use headers::Authorization;
+use std::error::Error;
+
+
+
 #[cfg(feature = "rustls-client")]
 use hyper_rustls::{HttpsConnector as RustlsConnector, HttpsConnectorBuilder};
 #[cfg(feature = "native-tls-client")]
