@@ -1,5 +1,6 @@
 use crate::{
-    certificate_authority::CertificateAuthority, HttpHandler, NoopHandler, Proxy, WebSocketHandler,
+    certificate_authority::CertificateAuthority, proxy::Proxy, HttpHandler, MessageHandler,
+    NoopHttpHandler, NoopMessageHandler,
 };
 use hyper::{
     client::{connect::Connect, Client, HttpConnector},
@@ -13,45 +14,8 @@ use std::{
     net::{SocketAddr, TcpListener},
     sync::Arc,
 };
-use tokio_tungstenite::Connector;
 
-/// A builder for creating a [`Proxy`].
-///
-/// # Examples
-///
-/// ```rust
-/// # #[cfg(all(feature = "rcgen-ca", feature = "rustls-client"))]
-/// # {
-/// use hudsucker::Proxy;
-/// # use hudsucker::certificate_authority::RcgenAuthority;
-/// # use rustls_pemfile as pemfile;
-/// # use tokio_rustls::rustls;
-/// #
-/// # let mut private_key_bytes: &[u8] = include_bytes!("../../examples/ca/hudsucker.key");
-/// # let mut ca_cert_bytes: &[u8] = include_bytes!("../../examples/ca/hudsucker.cer");
-/// # let private_key = rustls::PrivateKey(
-/// #     pemfile::pkcs8_private_keys(&mut private_key_bytes)
-/// #         .expect("Failed to parse private key")
-/// #         .remove(0),
-/// # );
-/// # let ca_cert = rustls::Certificate(
-/// #     pemfile::certs(&mut ca_cert_bytes)
-/// #         .expect("Failed to parse CA certificate")
-/// #         .remove(0),
-/// # );
-/// #
-/// # let ca = RcgenAuthority::new(private_key, ca_cert, 1_000)
-/// #     .expect("Failed to create Certificate Authority");
-///
-/// // let ca = ...;
-///
-/// let proxy = Proxy::builder()
-///     .with_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
-///     .with_rustls_client()
-///     .with_ca(ca)
-///     .build();
-/// # }
-/// ```
+/// A builder for creating a proxy.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ProxyBuilder<T>(T);
 
@@ -124,12 +88,23 @@ impl ProxyBuilder<WantsClient> {
 
         let https = https.build();
 
+        let proxy = {
+            let proxy_uri = "http://localhost:8888".parse().unwrap();
+            let mut proxy = Proxy::new(Intercept::All, proxy_uri);
+            // proxy.set_authorization(Authorization::basic("John Doe", "Agent1234"));
+            let connector = HttpConnector::new();
+            let proxy_connector = ProxyConnector::from_proxy(connector, proxy).unwrap();
+            proxy_connector
+        };
+    
+
         ProxyBuilder(WantsCa {
             als: self.0.als,
             client: Client::builder()
+                
                 .http1_title_case_headers(true)
                 .http1_preserve_header_case(true)
-                .build(https),
+                .build(proxy),
         })
     }
 
@@ -164,86 +139,115 @@ impl ProxyBuilder<WantsClient> {
 
 /// Builder state that needs a certificate authority.
 #[derive(Debug)]
-pub struct WantsCa<C> {
+pub struct WantsCa<C>
+where
+    C: Connect + Clone + Send + Sync + 'static,
+{
     als: AddrListenerServer,
     client: Client<C>,
 }
 
-impl<C> ProxyBuilder<WantsCa<C>> {
+impl<C> ProxyBuilder<WantsCa<C>>
+where
+    C: Connect + Clone + Send + Sync + 'static,
+{
     /// Set the certificate authority to use.
     pub fn with_ca<CA: CertificateAuthority>(
         self,
         ca: CA,
-    ) -> ProxyBuilder<WantsHandlers<C, CA, NoopHandler, NoopHandler>> {
+    ) -> ProxyBuilder<WantsHandlers<C, CA, NoopHttpHandler, NoopMessageHandler, NoopMessageHandler>>
+    {
         ProxyBuilder(WantsHandlers {
             als: self.0.als,
             client: self.0.client,
             ca,
-            http_handler: NoopHandler::new(),
-            websocket_handler: NoopHandler::new(),
-            websocket_connector: None,
+            http_handler: NoopHttpHandler::new(),
+            incoming_message_handler: NoopMessageHandler::new(),
+            outgoing_message_handler: NoopMessageHandler::new(),
         })
     }
 }
 
 /// Builder state that can take additional handlers.
-pub struct WantsHandlers<C, CA, H, W> {
+#[derive(Debug)]
+pub struct WantsHandlers<C, CA, H, M1, M2>
+where
+    C: Connect + Clone + Send + Sync + 'static,
+    CA: CertificateAuthority,
+    H: HttpHandler,
+    M1: MessageHandler,
+    M2: MessageHandler,
+{
     als: AddrListenerServer,
     client: Client<C>,
     ca: CA,
     http_handler: H,
-    websocket_handler: W,
-    websocket_connector: Option<Connector>,
+    incoming_message_handler: M1,
+    outgoing_message_handler: M2,
 }
 
-impl<C, CA, H, W> ProxyBuilder<WantsHandlers<C, CA, H, W>> {
+impl<C, CA, H, M1, M2> ProxyBuilder<WantsHandlers<C, CA, H, M1, M2>>
+where
+    C: Connect + Clone + Send + Sync + 'static,
+    CA: CertificateAuthority,
+    H: HttpHandler,
+    M1: MessageHandler,
+    M2: MessageHandler,
+{
     /// Set the HTTP handler.
     pub fn with_http_handler<H2: HttpHandler>(
         self,
         http_handler: H2,
-    ) -> ProxyBuilder<WantsHandlers<C, CA, H2, W>> {
+    ) -> ProxyBuilder<WantsHandlers<C, CA, H2, M1, M2>> {
         ProxyBuilder(WantsHandlers {
             als: self.0.als,
             client: self.0.client,
             ca: self.0.ca,
             http_handler,
-            websocket_handler: self.0.websocket_handler,
-            websocket_connector: self.0.websocket_connector,
+            incoming_message_handler: self.0.incoming_message_handler,
+            outgoing_message_handler: self.0.outgoing_message_handler,
         })
     }
 
-    /// Set the WebSocket handler.
-    pub fn with_websocket_handler<W2: WebSocketHandler>(
+    /// Set the incoming message handler.
+    pub fn with_incoming_message_handler<M: MessageHandler>(
         self,
-        websocket_handler: W2,
-    ) -> ProxyBuilder<WantsHandlers<C, CA, H, W2>> {
+        incoming_message_handler: M,
+    ) -> ProxyBuilder<WantsHandlers<C, CA, H, M, M2>> {
         ProxyBuilder(WantsHandlers {
             als: self.0.als,
             client: self.0.client,
             ca: self.0.ca,
             http_handler: self.0.http_handler,
-            websocket_handler,
-            websocket_connector: self.0.websocket_connector,
+            incoming_message_handler,
+            outgoing_message_handler: self.0.outgoing_message_handler,
         })
     }
 
-    /// Set the connector to use when connecting to WebSocket servers.
-    pub fn with_websocket_connector(self, connector: Connector) -> Self {
+    /// Set the outgoing message handler.
+    pub fn with_outgoing_message_handler<M: MessageHandler>(
+        self,
+        outgoing_message_handler: M,
+    ) -> ProxyBuilder<WantsHandlers<C, CA, H, M1, M>> {
         ProxyBuilder(WantsHandlers {
-            websocket_connector: Some(connector),
-            ..self.0
+            als: self.0.als,
+            client: self.0.client,
+            ca: self.0.ca,
+            http_handler: self.0.http_handler,
+            incoming_message_handler: self.0.incoming_message_handler,
+            outgoing_message_handler,
         })
     }
 
     /// Build the proxy.
-    pub fn build(self) -> Proxy<C, CA, H, W> {
+    pub fn build(self) -> Proxy<C, CA, H, M1, M2> {
         Proxy {
             als: self.0.als,
             client: self.0.client,
             ca: Arc::new(self.0.ca),
             http_handler: self.0.http_handler,
-            websocket_handler: self.0.websocket_handler,
-            websocket_connector: self.0.websocket_connector,
+            incoming_message_handler: self.0.incoming_message_handler,
+            outgoing_message_handler: self.0.outgoing_message_handler,
         }
     }
 }
