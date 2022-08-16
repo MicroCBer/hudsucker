@@ -38,6 +38,7 @@ tokio-rustls = "0.23.0"
 tokio-tungstenite = { version = "0.17.2" }
 tokio-util = { version = "0.7.0", features = ["io"], optional = true }
 tracing = { version = "0.1.21", features = ["log"] }
+hyper-proxy = "*"
 
 [dev-dependencies]
 async-http-proxy = { version = "1.2.5", features = ["runtime-tokio"] }
